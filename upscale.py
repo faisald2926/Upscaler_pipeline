@@ -461,6 +461,8 @@ def make_progress() -> Progress:
 
 def get_fps(video_path: Path) -> str:
     """Get r_frame_rate from a video file."""
+    if not video_path.exists():
+        return ""
     ffprobe_path = check_tool("ffprobe")
     r = subprocess.run(
         [ffprobe_path, "-v", "quiet", "-select_streams", "v:0",
@@ -503,7 +505,6 @@ def get_frame_count(video_path: Path) -> int:
 
 def run_ffmpeg_with_progress(cmd: list[str], total: int, task_desc: str, progress: Progress):
     """Run ffmpeg with -progress pipe:1 and update progress bar."""
-    import tempfile
 
     task = progress.add_task(task_desc, total=total)
 
@@ -642,6 +643,9 @@ def stage_upscale(progress: Progress):
     frames_out_dir.mkdir(parents=True, exist_ok=True)
 
     total_frames = len(list(frames_in_dir.glob("*.png")))
+    if total_frames == 0:
+        console.print("[red]✗ No frames found in work/frames_in/. Cannot upscale.[/]")
+        sys.exit(1)
     console.print(f"[dim]  ↳ Frames to upscale: {total_frames}[/]")
     console.print("[dim]  ↳ Model: realesr-animevideov3 (x2), tile: 256, GPU: 0[/]")
     console.print("[dim]  ↳ Expected: ~2-4 hours for a 23-min episode on RTX 3070[/]")
@@ -996,8 +1000,17 @@ def pipeline(skip_verify, input_path):
             if p.exists():
                 shutil.rmtree(p)
 
-        run_pipeline(mkv_path, output_dir=source_dir)
-        completed += 1
+        try:
+            run_pipeline(mkv_path, output_dir=source_dir)
+            completed += 1
+        except SystemExit:
+            console.print(f"[red]  ✗ Pipeline failed for {mkv_path.name}. Moving to next file.[/]")
+            skipped += 1
+            continue
+        except Exception as e:
+            console.print(f"[red]  ✗ Unexpected error for {mkv_path.name}: {e}[/]")
+            skipped += 1
+            continue
 
         # Post-pipeline cleanup: free disk space for the next episode
         console.print("[dim]  ↳ Cleaning up scratch files...[/]")
