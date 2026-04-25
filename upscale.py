@@ -798,14 +798,14 @@ def stage_encode(progress: Progress):
     console.print("[green]  ✓ Stage 4 ENCODE complete[/]")
 
 
-def stage_mux(mkv_path: Path, output_dir: Path, progress: Progress):
+def stage_mux(mkv_path: Path, output_dir: Path, progress: Progress) -> Path:
     """Stage 5: Mux video + audio + subs into final output."""
-    if stage_done("mux"):
-        console.print("[dim]  ↳ Stage 5 (MUX) already done, skipping.[/]")
-        return
-
     stem = mkv_path.stem
     output_path = output_dir / f"{stem} [4K Upscale].mkv"
+
+    if stage_done("mux"):
+        console.print("[dim]  ↳ Stage 5 (MUX) already done, skipping.[/]")
+        return output_path
 
     video_4k = WORK_DIR / "video_4k.mkv"
 
@@ -845,20 +845,6 @@ def stage_mux(mkv_path: Path, output_dir: Path, progress: Progress):
 
     mark_done("mux")
     console.print("[green]  ✓ Stage 5 MUX complete[/]")
-
-    # Cleanup scratch directories
-    console.print("[dim]  ↳ Cleaning up scratch directories...[/]")
-    for d in ["frames_in", "frames_out"]:
-        p = WORK_DIR / d
-        if p.exists():
-            shutil.rmtree(p)
-            console.print(f"[dim]    Deleted work/{d}/[/]")
-    # Also clean video.mkv and video_4k.mkv to free space for next file
-    for f in ["video.mkv", "video_4k.mkv"]:
-        p = WORK_DIR / f
-        if p.exists():
-            p.unlink()
-            console.print(f"[dim]    Deleted work/{f}[/]")
 
     return output_path
 
@@ -999,15 +985,28 @@ def pipeline(skip_verify, input_path):
             if score < 55:
                 console.print("[bold yellow]⚠ Score is marginal. Proceeding anyway.[/]")
 
-        # Clean work directory markers before each new file
+        # Clean work directory completely before each new file
+        console.print("[dim]  ↳ Preparing clean work directory...[/]")
         for marker in [".demux.done", ".extract.done", ".upscale.done", ".encode.done", ".mux.done"]:
             (WORK_DIR / marker).unlink(missing_ok=True)
-        # Clean leftover intermediate files
         for leftover in ["video.mkv", "video_4k.mkv"]:
             (WORK_DIR / leftover).unlink(missing_ok=True)
+        for d in ["frames_in", "frames_out"]:
+            p = WORK_DIR / d
+            if p.exists():
+                shutil.rmtree(p)
 
         run_pipeline(mkv_path, output_dir=source_dir)
         completed += 1
+
+        # Post-pipeline cleanup: free disk space for the next episode
+        console.print("[dim]  ↳ Cleaning up scratch files...[/]")
+        for d in ["frames_in", "frames_out"]:
+            p = WORK_DIR / d
+            if p.exists():
+                shutil.rmtree(p)
+        for leftover in ["video.mkv", "video_4k.mkv"]:
+            (WORK_DIR / leftover).unlink(missing_ok=True)
 
     # ── Final Summary ──
     console.print()
