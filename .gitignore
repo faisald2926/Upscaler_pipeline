@@ -1,0 +1,18 @@
+# Ignore huge video files
+*.mkv
+*.mp4
+*.avi
+*.mka
+*.mks
+
+# Ignore scratch/working directory
+work/
+scratch/
+
+# Ignore compiled models and binaries
+tools/
+
+# Python caches
+__pycache__/
+*.pyc
+.env
