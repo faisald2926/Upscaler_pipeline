@@ -512,34 +512,36 @@ def run_ffmpeg_with_progress(cmd: list[str], total: int, task_desc: str, progres
     stderr_file = WORK_DIR / f".ffmpeg_stderr_{os.getpid()}.log"
     stderr_fh = open(stderr_file, "w", encoding="utf-8", errors="replace")
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=stderr_fh,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=stderr_fh,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
 
-    current_frame = 0
+        current_frame = 0
 
-    # Read stdout for progress (ffmpeg -progress pipe:1 writes to stdout)
-    for line in proc.stdout:
-        line = line.strip()
-        if line.startswith("frame="):
-            try:
-                val = int(line.split("=", 1)[1].strip())
-                delta = val - current_frame
-                if delta > 0:
-                    progress.update(task, advance=delta)
-                    current_frame = val
-            except (ValueError, IndexError):
-                pass
-        if line == "progress=end":
-            break
+        # Read stdout for progress (ffmpeg -progress pipe:1 writes to stdout)
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("frame="):
+                try:
+                    val = int(line.split("=", 1)[1].strip())
+                    delta = val - current_frame
+                    if delta > 0:
+                        progress.update(task, advance=delta)
+                        current_frame = val
+                except (ValueError, IndexError):
+                    pass
+            if line == "progress=end":
+                break
 
-    proc.wait(timeout=120)
-    stderr_fh.close()
+        proc.wait(timeout=120)
+    finally:
+        stderr_fh.close()
 
     if proc.returncode != 0:
         progress.update(task, completed=current_frame)
@@ -781,6 +783,7 @@ def stage_encode(progress: Progress):
         "-cq", "18",           # Constant Quality target (NVENC equivalent to CRF)
         "-b:v", "0",           # Required to enable pure CQ mode on NVENC
         "-pix_fmt", "p010le",  # 10-bit pixel format required for hardware encoding
+        "-sws_flags", "lanczos",  # Sharp scaling for anime lines during colorspace conversion
         "-color_primaries", "bt709",
         "-color_trc", "bt709",
         "-colorspace", "bt709",
@@ -805,6 +808,10 @@ def stage_encode(progress: Progress):
 def stage_mux(mkv_path: Path, output_dir: Path, progress: Progress) -> Path:
     """Stage 5: Mux video + audio + subs into final output."""
     stem = mkv_path.stem
+    # Truncate stem if the full output path would exceed Windows 260-char limit
+    max_stem = 200 - len(str(output_dir)) - len(" [4K Upscale].mkv")
+    if len(stem) > max_stem > 30:
+        stem = stem[:max_stem]
     output_path = output_dir / f"{stem} [4K Upscale].mkv"
 
     if stage_done("mux"):
