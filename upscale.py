@@ -652,13 +652,16 @@ def stage_upscale(progress: Progress):
         """Run upscale with given tile size by chunking frames to avoid memory leaks/hangs."""
         chunk_size = 1000
         frames_list = sorted(list(frames_in_dir.glob("*.png")))
+        total_chunks = (len(frames_list) + chunk_size - 1) // chunk_size
         
         task = progress.add_task(f"[3/5] UPSCALE (tile={tile_size})", total=total_frames)
 
-        for i in range(0, len(frames_list), chunk_size):
+        for chunk_idx, i in enumerate(range(0, len(frames_list), chunk_size)):
             chunk_frames = frames_list[i : i + chunk_size]
             chunk_in_dir = frames_in_dir / f"chunk_{i:06d}"
             chunk_in_dir.mkdir(exist_ok=True)
+            
+            console.print(f"[dim]  ↳ Chunk {chunk_idx+1}/{total_chunks} ({len(chunk_frames)} frames)[/]")
             
             # Move frames to chunk directory
             for f in chunk_frames:
@@ -674,10 +677,8 @@ def stage_upscale(progress: Progress):
                 "-t", str(tile_size),
                 "-j", "1:2:2",
                 "-g", "0",
-                "-x", # enable tta mode just in case, no wait, without -x
                 "-m", str(MODELS_DIR),
             ]
-            cmd.remove("-x")
 
             proc = subprocess.Popen(
                 cmd,
@@ -688,35 +689,37 @@ def stage_upscale(progress: Progress):
                 errors="replace",
             )
 
-            # Monitor progress by reading stdout
-            stderr_lines = []
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                # Realesrgan outputs percentages for each file like "12.50%"
-                if "%" in line:
-                    # We can count the output files directly instead of parsing percentages
-                    pass
-                else:
-                    line_str = line.strip()
-                    if line_str:
-                        stderr_lines.append(line_str)
-                        # Realesrgan outputs "... done" when a file is finished
-                        if "done" in line_str:
-                            progress.update(task, advance=1)
+            # Monitor progress by polling output file count
+            # (realesrgan buffers stdout so readline-based tracking doesn't update the bar)
+            last_count = len(list(frames_out_dir.glob("*.png")))
+            while proc.poll() is None:
+                time.sleep(2)
+                current_count = len(list(frames_out_dir.glob("*.png")))
+                if current_count > last_count:
+                    progress.update(task, advance=current_count - last_count)
+                    last_count = current_count
             
-            proc.wait()
+            # Read any remaining output for error reporting
+            remaining = proc.stdout.read()
+            stderr_lines = [l.strip() for l in remaining.split("\n") if l.strip()] if remaining else []
 
-            # Move frames back to frames_in_dir for potential cleanup later
+            # Final count update after chunk finishes
+            current_count = len(list(frames_out_dir.glob("*.png")))
+            if current_count > last_count:
+                progress.update(task, advance=current_count - last_count)
+
+            # Move frames back to frames_in_dir
             for f in chunk_frames:
                 moved_file = chunk_in_dir / f.name
                 if moved_file.exists():
                     moved_file.rename(frames_in_dir / f.name)
-            chunk_in_dir.rmdir()
+            try:
+                chunk_in_dir.rmdir()
+            except OSError:
+                pass
 
             if proc.returncode != 0:
-                console.print(f"\n[red]✗ Upscale failed at chunk {i}:[/]")
+                console.print(f"\n[red]✗ Upscale failed at chunk {chunk_idx+1}:[/]")
                 if stderr_lines:
                     console.print("[bold red]Last 20 lines of output:[/]")
                     for line in stderr_lines[-20:]:
@@ -795,14 +798,14 @@ def stage_encode(progress: Progress):
     console.print("[green]  ✓ Stage 4 ENCODE complete[/]")
 
 
-def stage_mux(mkv_path: Path, progress: Progress):
+def stage_mux(mkv_path: Path, output_dir: Path, progress: Progress):
     """Stage 5: Mux video + audio + subs into final output."""
     if stage_done("mux"):
         console.print("[dim]  ↳ Stage 5 (MUX) already done, skipping.[/]")
         return
 
     stem = mkv_path.stem
-    output_path = SCRIPT_DIR / f"{stem} [4K Upscale].mkv"
+    output_path = output_dir / f"{stem} [4K Upscale].mkv"
 
     video_4k = WORK_DIR / "video_4k.mkv"
 
@@ -843,22 +846,28 @@ def stage_mux(mkv_path: Path, progress: Progress):
     mark_done("mux")
     console.print("[green]  ✓ Stage 5 MUX complete[/]")
 
-    # Cleanup frame directories (keep video.mkv, audio.mka, subs.mks for re-runs)
-    console.print("[dim]  ↳ Cleaning up scratch frame directories...[/]")
-    frames_in = WORK_DIR / "frames_in"
-    frames_out = WORK_DIR / "frames_out"
-    if frames_in.exists():
-        shutil.rmtree(frames_in)
-        console.print("[dim]    Deleted work/frames_in/[/]")
-    if frames_out.exists():
-        shutil.rmtree(frames_out)
-        console.print("[dim]    Deleted work/frames_out/[/]")
+    # Cleanup scratch directories
+    console.print("[dim]  ↳ Cleaning up scratch directories...[/]")
+    for d in ["frames_in", "frames_out"]:
+        p = WORK_DIR / d
+        if p.exists():
+            shutil.rmtree(p)
+            console.print(f"[dim]    Deleted work/{d}/[/]")
+    # Also clean video.mkv and video_4k.mkv to free space for next file
+    for f in ["video.mkv", "video_4k.mkv"]:
+        p = WORK_DIR / f
+        if p.exists():
+            p.unlink()
+            console.print(f"[dim]    Deleted work/{f}[/]")
 
     return output_path
 
 
-def run_pipeline(mkv_path: Path):
+def run_pipeline(mkv_path: Path, output_dir: Path = None):
     """Run the 5-stage pipeline."""
+    if output_dir is None:
+        output_dir = mkv_path.parent
+
     console.print()
     console.print(Panel.fit(
         "[bold magenta]4K Upscale Pipeline[/]",
@@ -883,7 +892,7 @@ def run_pipeline(mkv_path: Path):
         stage_encode(progress)
 
         # Stage 5: Mux
-        output = stage_mux(mkv_path, progress)
+        output = stage_mux(mkv_path, output_dir, progress)
 
     console.print()
     console.print(Panel.fit(
@@ -923,26 +932,29 @@ def verify(mkv_file):
 
 @cli.command()
 @click.option("--skip-verify", is_flag=True, help="Skip verifier step")
-@click.option("--input", "input_path", default=None, help="Path to specific .mkv file or a folder containing .mkv files")
+@click.option("--input", "input_path", default=None, help="Path to a .mkv file or a folder of .mkv files")
 def pipeline(skip_verify, input_path):
     """Run the full upscale pipeline on one or a folder of MKV files."""
     _check_deps(verify_only=False)
 
     # Determine files to process
     files_to_process = []
+    source_dir = SCRIPT_DIR  # default output location
+
     if input_path:
-        p = Path(input_path)
+        p = Path(input_path).resolve()
         if p.is_file() and p.suffix.lower() == ".mkv":
             files_to_process = [p]
+            source_dir = p.parent
         elif p.is_dir():
             files_to_process = sorted(list(p.glob("*.mkv")))
+            source_dir = p
         else:
             console.print("[red]Invalid input path. Must be an .mkv file or a directory.[/]")
             sys.exit(1)
     else:
-        # Default: Process all MKVs in the current directory
-        all_mkvs = sorted(list(SCRIPT_DIR.glob("*.mkv")))
-        files_to_process = all_mkvs
+        # Default: Process all MKVs in the script directory
+        files_to_process = sorted(list(SCRIPT_DIR.glob("*.mkv")))
         
     # Filter out files that have already been upscaled
     files_to_process = [f for f in files_to_process if "[4K Upscale]" not in f.name and ".4K.upscaled" not in f.name]
@@ -951,23 +963,62 @@ def pipeline(skip_verify, input_path):
         console.print("[red]No new .mkv files found to process.[/]")
         sys.exit(1)
 
+    # ── Batch Summary Banner ──
+    total_size = sum(f.stat().st_size for f in files_to_process) / (1024 ** 3)
+    console.print()
+    summary = Table(title="Batch Queue", show_header=True, header_style="bold cyan", border_style="magenta")
+    summary.add_column("#", style="bold", width=4)
+    summary.add_column("File", style="white")
+    summary.add_column("Size", style="dim", justify="right")
+    for idx, f in enumerate(files_to_process):
+        size_mb = f.stat().st_size / (1024 ** 2)
+        summary.add_row(str(idx + 1), f.name, f"{size_mb:.0f} MB")
+    console.print(summary)
+    console.print(f"[bold cyan]Total:[/] {len(files_to_process)} file(s), {total_size:.1f} GB")
+    console.print(f"[bold cyan]Output:[/] {source_dir}")
+    console.print()
+
+    completed = 0
+    skipped = 0
     for idx, mkv_path in enumerate(files_to_process):
-        console.rule(f"Processing File {idx+1}/{len(files_to_process)}: {mkv_path.name}")
+        console.rule(f"[bold] Episode {idx+1}/{len(files_to_process)}: {mkv_path.name} ", style="magenta")
         
+        # Check if output already exists
+        output_file = source_dir / f"{mkv_path.stem} [4K Upscale].mkv"
+        if output_file.exists():
+            console.print(f"[yellow]  ⚠ Output already exists, skipping: {output_file.name}[/]")
+            skipped += 1
+            continue
+
         if not skip_verify:
             score = run_verifier(mkv_path)
             if score < 35:
                 console.print(f"[bold red]❌ Score too low (<35) for {mkv_path.name}. Skipping.[/]")
+                skipped += 1
                 continue
             if score < 55:
-                console.print("[bold yellow]⚠ Score is marginal. Proceeding anyway (use --skip-verify to suppress).[/]")
+                console.print("[bold yellow]⚠ Score is marginal. Proceeding anyway.[/]")
 
-        run_pipeline(mkv_path)
-        
-        # Reset the work markers so the next file can process cleanly
-        if len(files_to_process) > 1:
-            for marker in [".demux.done", ".extract.done", ".upscale.done", ".encode.done", ".mux.done"]:
-                (WORK_DIR / marker).unlink(missing_ok=True)
+        # Clean work directory markers before each new file
+        for marker in [".demux.done", ".extract.done", ".upscale.done", ".encode.done", ".mux.done"]:
+            (WORK_DIR / marker).unlink(missing_ok=True)
+        # Clean leftover intermediate files
+        for leftover in ["video.mkv", "video_4k.mkv"]:
+            (WORK_DIR / leftover).unlink(missing_ok=True)
+
+        run_pipeline(mkv_path, output_dir=source_dir)
+        completed += 1
+
+    # ── Final Summary ──
+    console.print()
+    console.print(Panel.fit(
+        f"[bold green]✓ Batch Complete![/]\n"
+        f"  Processed: [cyan]{completed}[/] file(s)\n"
+        f"  Skipped:   [yellow]{skipped}[/] file(s)\n"
+        f"  Output:    [cyan]{source_dir}[/]",
+        border_style="green",
+        title="Summary",
+    ))
 
 
 def _check_deps(verify_only: bool):
@@ -996,12 +1047,13 @@ def _check_deps(verify_only: bool):
 
     # Check models if not verify-only
     if not verify_only:
-        model_param = MODELS_DIR / "realesrgan-x4plus-anime.param"
-        model_bin = MODELS_DIR / "realesrgan-x4plus-anime.bin"
+        model_param = MODELS_DIR / "realesr-animevideov3-x2.param"
+        model_bin = MODELS_DIR / "realesr-animevideov3-x2.bin"
         if model_param.exists() and model_bin.exists():
             console.print(f"  [green]✓[/] Model files: {MODELS_DIR}")
         else:
             console.print(f"  [red]✗[/] Model files missing in {MODELS_DIR}")
+            console.print(f"  [dim]  Expected: {model_param.name} and {model_bin.name}[/]")
             sys.exit(1)
 
     console.print()
